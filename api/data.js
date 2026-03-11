@@ -1,5 +1,3 @@
-const https = require('https');
-
 const SUBREDDITS = [
   'Polymarket',
   'Kalshi',
@@ -11,35 +9,66 @@ const SUBREDDITS = [
   'ManifoldMarkets'
 ];
 
-function fetchJSON(url) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      headers: { 'User-Agent': 'PolymarketDashboard/1.0 (competitor analysis tool)' },
-      timeout: 8000
-    };
-    const req = https.get(url, options, (res) => {
-      if (res.statusCode === 429) {
-        reject(new Error('Rate limited'));
-        return;
-      }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Parse error')); }
+const UA = 'Mozilla/5.0 (compatible; RedditDashboard/1.0; +https://github.com/vipulsharmaapi)';
+
+async function fetchJSON(url, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': UA,
+          'Accept': 'application/json',
+          'Accept-Language': 'en-US,en;q=0.5'
+        },
+        redirect: 'follow',
+        signal: controller.signal
       });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-  });
+      clearTimeout(timeout);
+
+      if (res.status === 429) {
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`Rate limited (429)`);
+      }
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        // If Reddit returned HTML instead of JSON, try old.reddit.com
+        if (url.includes('www.reddit.com') && attempt < retries) {
+          url = url.replace('www.reddit.com', 'old.reddit.com');
+          continue;
+        }
+        throw new Error(`Not JSON (status ${res.status}, body starts: ${text.substring(0, 100)})`);
+      }
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    }
+  }
+}
+
+function delay(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 async function fetchSubredditData(sub) {
-  const [about, newPosts, hotPosts] = await Promise.all([
-    fetchJSON(`https://www.reddit.com/r/${sub}/about.json`),
-    fetchJSON(`https://www.reddit.com/r/${sub}/new.json?limit=25`),
-    fetchJSON(`https://www.reddit.com/r/${sub}/hot.json?limit=10`)
-  ]);
+  // Stagger the 3 requests slightly to avoid triggering rate limits
+  const about = await fetchJSON(`https://www.reddit.com/r/${sub}/about.json`);
+  await delay(300);
+  const newPosts = await fetchJSON(`https://www.reddit.com/r/${sub}/new.json?limit=25`);
+  await delay(300);
+  const hotPosts = await fetchJSON(`https://www.reddit.com/r/${sub}/hot.json?limit=10`);
 
   const info = about.data;
   const posts = newPosts.data.children.map(p => p.data);
@@ -89,35 +118,44 @@ async function fetchSubredditData(sub) {
 
 module.exports = async function handler(req, res) {
   try {
-    // Fetch ALL 8 subreddits in parallel (no delays) for speed
-    const results = await Promise.all(
-      SUBREDDITS.map(sub =>
-        fetchSubredditData(sub).catch(err => ({
-          name: sub,
-          error: err.message,
-          subscribers: 0,
-          activeUsers: 0,
-          recentPostCount: 0,
-          recentUpvotes: 0,
-          recentComments: 0,
-          avgScore: 0,
-          avgComments: 0,
-          postsPerK: 0,
-          upvotesPerK: 0,
-          commentsPerK: 0,
-          hotPosts: [],
-          newPosts: []
-        }))
-      )
-    );
+    // Fetch subreddits in batches of 2 with delays to avoid Reddit rate limits
+    const results = [];
+    for (let i = 0; i < SUBREDDITS.length; i += 2) {
+      const batch = SUBREDDITS.slice(i, i + 2);
+      const batchResults = await Promise.all(
+        batch.map(sub =>
+          fetchSubredditData(sub).catch(err => ({
+            name: sub,
+            error: err.message,
+            subscribers: 0,
+            activeUsers: 0,
+            recentPostCount: 0,
+            recentUpvotes: 0,
+            recentComments: 0,
+            avgScore: 0,
+            avgComments: 0,
+            postsPerK: 0,
+            upvotesPerK: 0,
+            commentsPerK: 0,
+            hotPosts: [],
+            newPosts: []
+          }))
+        )
+      );
+      results.push(...batchResults);
+      // Wait between batches to avoid rate limiting
+      if (i + 2 < SUBREDDITS.length) {
+        await delay(1500);
+      }
+    }
 
     const data = {
       subreddits: results,
       fetchedAt: new Date().toISOString()
     };
 
-    // Cache for 2 min, serve stale for 5 min while revalidating
-    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=300');
+    // Cache for 5 min, serve stale for 10 min while revalidating
+    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.status(200).json(data);
   } catch (err) {
